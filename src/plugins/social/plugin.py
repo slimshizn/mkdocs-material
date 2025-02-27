@@ -1,4 +1,4 @@
-# Copyright (c) 2016-2022 Martin Donath <martin.donath@squidfunk.com>
+# Copyright (c) 2016-2025 Martin Donath <martin.donath@squidfunk.com>
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to
@@ -18,75 +18,131 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 # IN THE SOFTWARE.
 
+# -----------------------------------------------------------------------------
+# Disclaimer
+# -----------------------------------------------------------------------------
+# Please note: this version of the social plugin is not actively development
+# anymore. Instead, Material for MkDocs Insiders ships a complete rewrite of
+# the plugin which is much more powerful and addresses all shortcomings of
+# this implementation. Additionally, the new social plugin allows to create
+# entirely custom social cards. You can probably imagine, that this was a lot
+# of work to pull off. If you run into problems, or want to have additional
+# functionality, please consider sponsoring the project. You can then use the
+# new version of the plugin immediately.
+# -----------------------------------------------------------------------------
+
+import concurrent.futures
+import functools
 import logging
 import os
+import posixpath
 import re
 import requests
 import sys
 
 from collections import defaultdict
 from hashlib import md5
+from html import unescape
 from io import BytesIO
 from mkdocs.commands.build import DuplicateFilter
-from mkdocs.config.config_options import Type
+from mkdocs.exceptions import PluginError
 from mkdocs.plugins import BasePlugin
+from mkdocs.utils import write_file
 from shutil import copyfile
-from tempfile import TemporaryFile
-from zipfile import ZipFile
+
+from .config import SocialConfig
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError as e:
+    import_errors = {repr(e)}
+else:
+    import_errors = set()
+
+cairosvg_error: str = ""
 
 try:
     from cairosvg import svg2png
-    from PIL import Image, ImageDraw, ImageFont
-    dependencies = True
-except ImportError:
-    dependencies = False
+except ImportError as e:
+    import_errors.add(repr(e))
+except OSError as e:
+    cairosvg_error = str(e)
+
 
 # -----------------------------------------------------------------------------
-# Class
+# Classes
 # -----------------------------------------------------------------------------
 
 # Social plugin
-class SocialPlugin(BasePlugin):
+class SocialPlugin(BasePlugin[SocialConfig]):
 
-    # Configuration scheme
-    config_scheme = (
-        ("enabled", Type(bool, default = True)),
-        ("cache_dir", Type(str, default = ".cache/plugin/social")),
-
-        # Options for social cards
-        ("cards", Type(bool, default = True)),
-        ("cards_dir", Type(str, default = "assets/images/social")),
-        ("cards_color", Type(dict, default = {})),
-        ("cards_font", Type(str, default = None)),
-    )
+    def __init__(self):
+        self._executor = concurrent.futures.ThreadPoolExecutor(4)
 
     # Retrieve configuration
     def on_config(self, config):
         self.color = colors.get("indigo")
-        if not self.config["cards"]:
+        if not self.config.enabled:
+            self.config.cards = False
+        if not self.config.cards:
             return
 
-        # Check if required dependencies are installed
-        if not dependencies:
-            log.error(
-                "Required dependencies of \"social\" plugin not found. "
-                "Install with: pip install pillow cairosvg"
+        # Check dependencies
+        if import_errors:
+            raise PluginError(
+                "Required dependencies of \"social\" plugin not found:\n"
+                + str("\n".join(map(lambda x: "- " + x, import_errors)))
+                + "\n\n--> Install with: pip install \"mkdocs-material[imaging]\""
             )
-            sys.exit()
+
+        if cairosvg_error:
+            raise PluginError(
+                "\"cairosvg\" Python module is installed, but it crashed with:\n"
+                + cairosvg_error
+                + "\n\n--> Check out the troubleshooting guide: https://t.ly/MfX6u"
+            )
+
+        # Move color options
+        if self.config.cards_color:
+
+            # Move background color to new option
+            value = self.config.cards_color.get("fill")
+            if value:
+                self.config.cards_layout_options["background_color"] = value
+
+            # Move color to new option
+            value = self.config.cards_color.get("text")
+            if value:
+                self.config.cards_layout_options["color"] = value
+
+        # Move font family to new option
+        if self.config.cards_font:
+            value = self.config.cards_font
+            self.config.cards_layout_options["font_family"] = value
+
+        # Check if site URL is defined
+        if not config.site_url:
+            log.warning(
+                "The \"site_url\" option is not set. The cards are generated, "
+                "but not linked, so they won't be visible on social media."
+            )
 
         # Ensure presence of cache directory
-        self.cache = self.config["cache_dir"]
+        self.cache = self.config.cache_dir
         if not os.path.isdir(self.cache):
             os.makedirs(self.cache)
 
         # Retrieve palette from theme configuration
-        theme = config["theme"]
+        theme = config.theme
         if "palette" in theme:
             palette = theme["palette"]
 
-            # Use first palette, if multiple are defined
+            # Find first palette that includes primary color definition
             if isinstance(palette, list):
-                palette = palette[0]
+                for p in palette:
+                    if "primary" in p and p["primary"]:
+                        palette = p
+                        break
 
             # Set colors according to palette
             if "primary" in palette and palette["primary"]:
@@ -94,24 +150,30 @@ class SocialPlugin(BasePlugin):
                 self.color = colors.get(primary, self.color)
 
         # Retrieve color overrides
-        self.color = { **self.color, **self.config["cards_color"] }
+        options = self.config.cards_layout_options
+        self.color = {
+            "fill": options.get("background_color", self.color["fill"]),
+            "text": options.get("color", self.color["text"])
+        }
 
         # Retrieve logo and font
-        self.logo = self._load_logo(config)
+        self._resized_logo_promise = self._executor.submit(self._load_resized_logo, config)
         self.font = self._load_font(config)
 
+        self._image_promises = []
+
     # Create social cards
-    def on_page_markdown(self, markdown, page, config, files):
-        if not self.config["cards"]:
+    def on_page_content(self, html, page, config, files):
+        if not self.config.cards:
             return
 
         # Resolve image directory
-        directory = self.config["cards_dir"]
+        directory = self.config.cards_dir
         file, _ = os.path.splitext(page.file.src_path)
 
         # Resolve path of image
         path = "{}.png".format(os.path.join(
-            config["site_dir"],
+            config.site_dir,
             directory,
             file
         ))
@@ -122,61 +184,95 @@ class SocialPlugin(BasePlugin):
             os.makedirs(directory)
 
         # Compute site name
-        site_name = config.get("site_name")
+        site_name = config.site_name
 
         # Compute page title and description
         title = page.meta.get("title", page.title)
-        description = config.get("site_description") or ""
+        description = config.site_description or ""
         if "description" in page.meta:
             description = page.meta["description"]
 
-        # Generate social card if not in cache - TODO: values from mkdocs.yml
+        # Check type of meta title - see https://t.ly/m1Us
+        if not isinstance(title, str):
+            log.error(
+                f"Page meta title of page '{page.file.src_uri}' must be a "
+                f"string, but is of type \"{type(title)}\"."
+            )
+            sys.exit(1)
+
+        # Check type of meta description - see https://t.ly/m1Us
+        if not isinstance(description, str):
+            log.error(
+                f"Page meta description of '{page.file.src_uri}' must be a "
+                f"string, but is of type \"{type(description)}\"."
+            )
+            sys.exit(1)
+
+        # Generate social card if not in cache
         hash = md5("".join([
             site_name,
             str(title),
             description
         ]).encode("utf-8"))
         file = os.path.join(self.cache, f"{hash.hexdigest()}.png")
-        if not os.path.isfile(file):
-            image = self._render_card(site_name, title, description)
-            image.save(file)
-
-        # Copy file from cache
-        copyfile(file, path)
+        self._image_promises.append(self._executor.submit(
+            self._cache_image,
+            cache_path = file, dest_path = path,
+            render_function = lambda: self._render_card(site_name, title, description)
+        ))
 
         # Inject meta tags into page
         meta = page.meta.get("meta", [])
         page.meta["meta"] = meta + self._generate_meta(page, config)
 
+    def on_post_build(self, config):
+        if not self.config.cards:
+            return
+
+        # Check for exceptions
+        for promise in self._image_promises:
+            promise.result()
+
     # -------------------------------------------------------------------------
+
+    # Render image to cache (if not present), then copy from cache to site
+    def _cache_image(self, cache_path, dest_path, render_function):
+        if not os.path.isfile(cache_path):
+            image = render_function()
+            image.save(cache_path)
+
+        # Copy file from cache
+        copyfile(cache_path, dest_path)
+
+    @functools.lru_cache(maxsize=None)
+    def _get_font(self, kind, size):
+        return ImageFont.truetype(self.font[kind], size)
 
     # Render social card
     def _render_card(self, site_name, title, description):
-        logo = self.logo
-
         # Render background and logo
         image = self._render_card_background((1200, 630), self.color["fill"])
         image.alpha_composite(
-            logo.resize((144, int(144 * logo.height / logo.width))),
+            self._resized_logo_promise.result(),
             (1200 - 228, 64 - 4)
         )
 
         # Render site name
-        font = ImageFont.truetype(self.font["Bold"], 36)
+        font = self._get_font("Bold", 36)
         image.alpha_composite(
             self._render_text((826, 48), font, site_name, 1, 20),
             (64 + 4, 64)
         )
 
         # Render page title
-        font = ImageFont.truetype(self.font["Bold"], 92)
+        font = self._get_font("Bold", 92)
         image.alpha_composite(
             self._render_text((826, 328), font, title, 3, 30),
             (64, 160)
         )
 
         # Render page description
-        font = ImageFont.truetype(self.font["Regular"], 28)
+        font = self._get_font("Regular", 28)
         image.alpha_composite(
             self._render_text((826, 80), font, description, 2, 14),
             (64 + 4, 512)
@@ -189,41 +285,37 @@ class SocialPlugin(BasePlugin):
     def _render_card_background(self, size, fill):
         return Image.new(mode = "RGBA", size = size, color = fill)
 
+    @functools.lru_cache(maxsize=None)
+    def _tmp_context(self):
+        image = Image.new(mode = "RGBA", size = (50, 50))
+        return ImageDraw.Draw(image)
+
+    @functools.lru_cache(maxsize=None)
+    def _text_bounding_box(self, text, font):
+        return self._tmp_context().textbbox((0, 0), text, font = font)
+
     # Render social card text
     def _render_text(self, size, font, text, lmax, spacing = 0):
+        width = size[0]
         lines, words = [], []
 
-        # Remove remnant HTML tags
+        # Remove remnant HTML tags and convert HTML entities
         text = re.sub(r"(<[^>]+>)", "", text)
-
-        # Create temporary image
-        image = Image.new(mode = "RGBA", size = size)
+        text = unescape(text)
 
         # Retrieve y-offset of textbox to correct for spacing
         yoffset = 0
 
         # Create drawing context and split text into lines
-        context = ImageDraw.Draw(image)
         for word in text.split(" "):
             combine = " ".join(words + [word])
-            textbox = context.textbbox((0, 0), combine, font = font)
+            textbox = self._text_bounding_box(combine, font = font)
             yoffset = textbox[1]
-            if not words or textbox[2] <= image.width:
+            if not words or textbox[2] <= width:
                 words.append(word)
             else:
                 lines.append(words)
                 words = [word]
-
-        # # Balance words on last line - TODO: overflows when broken word is too long
-        # if len(lines) > 0:
-        #     prev = len(" ".join(lines[-1]))
-        #     last = len(" ".join(words))#
-
-        #     print(last, prev)
-
-        #     # Heuristic: try to find a good ratio
-        #     if last / prev < 0.6:
-        #         words.insert(0, lines[-1].pop())
 
         # Join words for each line and create image
         lines.append(words)
@@ -244,22 +336,24 @@ class SocialPlugin(BasePlugin):
 
     # Generate meta tags
     def _generate_meta(self, page, config):
-        directory = self.config["cards_dir"]
-        file, _ = os.path.splitext(page.file.src_path)
+        directory = self.config.cards_dir
+        file, _ = os.path.splitext(page.file.src_uri)
 
         # Compute page title
-        title = page.meta.get("title", page.title)
-        if not page.is_homepage:
-            title = f"{title} - {config.get('site_name')}"
+        if page.is_homepage:
+            title = config.site_name
+        else:
+            page_title = page.meta.get("title", page.title)
+            title = f"{page_title} - {config.site_name}"
 
         # Compute page description
-        description = config.get("site_description")
+        description = config.site_description
         if "description" in page.meta:
             description = page.meta["description"]
 
         # Resolve image URL
-        url = "{}.png".format(os.path.join(
-            config.get("site_url"),
+        url = "{}.png".format(posixpath.join(
+            config.site_url or ".",
             directory,
             file
         ))
@@ -289,16 +383,28 @@ class SocialPlugin(BasePlugin):
             { "name": "twitter:image", "content": url }
         ]
 
+    def _load_resized_logo(self, config, width = 144):
+        logo = self._load_logo(config)
+        height = int(width * logo.height / logo.width)
+        return logo.resize((width, height))
+
     # Retrieve logo image or icon
     def _load_logo(self, config):
-        theme = config.get("theme")
+        theme = config.theme
 
         # Handle images (precedence over icons)
         if "logo" in theme:
             _, extension = os.path.splitext(theme["logo"])
 
+            path = os.path.join(config.docs_dir, theme["logo"])
+
+            # Allow users to put the logo inside their custom_dir (theme["logo"] case)
+            if theme.custom_dir:
+                custom_dir_logo = os.path.join(theme.custom_dir, theme["logo"])
+                if os.path.exists(custom_dir_logo):
+                    path = custom_dir_logo
+
             # Load SVG and convert to PNG
-            path = os.path.join(config["docs_dir"], theme["logo"])
             if extension == ".svg":
                 return self._load_logo_svg(path)
 
@@ -306,10 +412,11 @@ class SocialPlugin(BasePlugin):
             return Image.open(path).convert("RGBA")
 
         # Handle icons
-        logo = "material/library"
-        icon = theme["icon"] or {}
+        icon = theme.get("icon") or {}
         if "logo" in icon and icon["logo"]:
             logo = icon["logo"]
+        else:
+            logo = "material/library"
 
         # Resolve path of package
         base = os.path.abspath(os.path.join(
@@ -317,8 +424,15 @@ class SocialPlugin(BasePlugin):
             "../.."
         ))
 
+        path = f"{base}/templates/.icons/{logo}.svg"
+
+        # Allow users to put the logo inside their custom_dir (theme["icon"]["logo"] case)
+        if theme.custom_dir:
+            custom_dir_logo = os.path.join(theme.custom_dir, ".icons", f"{logo}.svg")
+            if os.path.exists(custom_dir_logo):
+                path = custom_dir_logo
+
         # Load icon data and fill with color
-        path = f"{base}/.icons/{logo}.svg"
         return self._load_logo_svg(path, self.color["text"])
 
     # Load SVG file and convert to PNG
@@ -334,52 +448,102 @@ class SocialPlugin(BasePlugin):
         svg2png(bytestring = data, write_to = file, scale = 10)
         return Image.open(file)
 
-    # Retrieve font
+    # Retrieve font either from the card layout option or from the Material
+    # font defintion. If no font is defined for Material or font is False
+    # then choose a default.
     def _load_font(self, config):
-        name = self.config.get("cards_font")
+        name = self.config.cards_layout_options.get("font_family")
         if not name:
-
-            # Retrieve from theme (default: Roboto)
-            theme = config["theme"]
-            if theme["font"]:
-                name = theme["font"]["text"]
-            else:
+            material_name = config.theme.get("font", False)
+            if material_name is False:
                 name = "Roboto"
+            else:
+                name = material_name.get("text", "Roboto")
 
-        # Retrieve font files, if not already done
-        files = os.listdir(self.cache)
-        files = [file for file in files if file.endswith(".ttf") or file.endswith(".otf")] or (
-            self._load_font_from_google(name)
-        )
-
-        # Map available font weights to file paths
-        font = dict()
-        for file in files:
-            match = re.search("-(\w+)\.[ot]tf$", file)
-            if match:
-                font[match.group(1)] = os.path.join(self.cache, file)
+        # Resolve relevant fonts
+        font = {}
+        for style in ["Regular", "Bold"]:
+            font[style] = self._resolve_font(name, style)
 
         # Return available font weights with fallback
         return defaultdict(lambda: font["Regular"], font)
 
-    # Retrieve font from Google Fonts
-    def _load_font_from_google(self, name):
-        url = "https://fonts.google.com/download?family={}"
-        res = requests.get(url.format(name.replace(" ", "+")), stream = True)
+    # Resolve font family with specific style - if we haven't already done it,
+    # the font family is first downloaded from Google Fonts and the styles are
+    # saved to the cache directory. If the font cannot be resolved, the plugin
+    # must abort with an error.
+    def _resolve_font(self, family: str, style: str):
+        path = os.path.join(self.config.cache_dir, "fonts", family)
 
-        # Write archive to temporary file
-        tmp = TemporaryFile()
-        for chunk in res.iter_content(chunk_size = 128):
-            tmp.write(chunk)
+        # Fetch font family, if it hasn't been fetched yet
+        if not os.path.isdir(path):
+            self._fetch_font_from_google_fonts(family)
 
-        # Unzip fonts from temporary file
-        zip = ZipFile(tmp)
-        files = [file for file in zip.namelist() if file.endswith(".ttf") or file.endswith(".otf")]
-        zip.extractall(self.cache, files)
+        # Check for availability of font style
+        list = sorted(os.listdir(path))
+        for file in list:
+            name, _ = os.path.splitext(file)
+            if name == style:
+                return os.path.join(path, file)
 
-        # Close and delete temporary file
-        tmp.close()
-        return files
+        # Find regular variant of font family - we cannot rely on the fact that
+        # fonts always have a single regular variant - some of them have several
+        # of them, potentially prefixed with "Condensed" etc. For this reason we
+        # use the first font we find if we find no regular one.
+        fallback = ""
+        for file in list:
+            name, _ = os.path.splitext(file)
+
+            # 1. Fallback: use first font
+            if not fallback:
+                fallback = name
+
+            # 2. Fallback: use regular font - use the shortest one, i.e., prefer
+            # "10pt Regular" over "10pt Condensed Regular". This is a heuristic.
+            if "Regular" in name:
+                if not fallback or len(name) < len(fallback):
+                    fallback = name
+
+        # Fall back to regular font (guess if there are multiple)
+        return self._resolve_font(family, fallback)
+
+    # Fetch font family from Google Fonts
+    def _fetch_font_from_google_fonts(self, family: str):
+        path = os.path.join(self.config.cache_dir, "fonts")
+
+        # Download manifest from Google Fonts - Google returns JSON with syntax
+        # errors, so we just treat the response as plain text and parse out all
+        # URLs to font files, as we're going to rename them anyway. This should
+        # be more resilient than trying to correct the JSON syntax.
+        url = f"https://fonts.google.com/download/list?family={family}"
+        res = requests.get(url)
+
+        # Ensure that the download succeeded
+        if res.status_code != 200:
+            raise PluginError(
+                f"Couldn't find font family '{family}' on Google Fonts "
+                f"({res.status_code}: {res.reason})"
+            )
+
+        # Extract font URLs from manifest
+        for match in re.findall(
+            r"\"(https:(?:.*?)\.[ot]tf)\"", str(res.content)
+        ):
+            with requests.get(match) as res:
+                res.raise_for_status()
+
+                # Extract font family name and style using the content in the
+                # response via ByteIO to avoid writing a temp file. Done to fix
+                # problems with passing a NamedTemporaryFile to
+                # ImageFont.truetype() on Windows, see https://t.ly/LiF_k
+                with BytesIO(res.content) as fontdata:
+                    font = ImageFont.truetype(fontdata)
+                    name, style = font.getname()
+                    name = " ".join([name.replace(family, ""), style]).strip()
+                    target = os.path.join(path, family, f"{name}.ttf")
+
+                # write file to cache
+                write_file(res.content, target)
 
 # -----------------------------------------------------------------------------
 # Data
@@ -390,7 +554,7 @@ log = logging.getLogger("mkdocs")
 log.addFilter(DuplicateFilter())
 
 # Color palette
-colors = dict({
+colors = {
     "red":         { "fill": "#ef5552", "text": "#ffffff" },
     "pink":        { "fill": "#e92063", "text": "#ffffff" },
     "purple":      { "fill": "#ab47bd", "text": "#ffffff" },
@@ -412,4 +576,4 @@ colors = dict({
     "blue-grey":   { "fill": "#546d78", "text": "#ffffff" },
     "black":       { "fill": "#000000", "text": "#ffffff" },
     "white":       { "fill": "#ffffff", "text": "#000000" }
-})
+}
