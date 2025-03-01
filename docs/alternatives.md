@@ -1,7 +1,3 @@
----
-template: overrides/main.html
----
-
 # Alternatives
 
 There are tons of static site generators and themes out there and choosing the
@@ -31,7 +27,7 @@ __Challenges__
 While [Docusaurus] is one of the best choices when it comes to documentation
 sites that output a single page application, there are many more solutions,
 including [Docz], [Gatsby], [Vuepress] and [Docsify] that approach
-this problem similarily.
+this problem similarly.
 
   [Docusaurus]: https://docusaurus.io/
   [React]: https://reactjs.org/
