@@ -1,4 +1,4 @@
-# Copyright (c) 2016-2022 Martin Donath <martin.donath@squidfunk.com>
+# Copyright (c) 2016-2025 Martin Donath <martin.donath@squidfunk.com>
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to
@@ -18,13 +18,13 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 # IN THE SOFTWARE.
 
-FROM python:3.9.2-alpine3.13
+FROM python:3.11-alpine3.19 AS build
 
 # Build-time flags
 ARG WITH_PLUGINS=true
 
 # Environment variables
-ENV PACKAGES=/usr/local/lib/python3.9/site-packages
+ENV PACKAGES=/usr/local/lib/python3.11/site-packages
 ENV PYTHONDONTWRITEBYTECODE=1
 
 # Set build directory
@@ -32,11 +32,10 @@ WORKDIR /tmp
 
 # Copy files necessary for build
 COPY material material
-COPY MANIFEST.in MANIFEST.in
 COPY package.json package.json
 COPY README.md README.md
-COPY requirements.txt requirements.txt
-COPY setup.py setup.py
+COPY *requirements.txt ./
+COPY pyproject.toml pyproject.toml
 
 # Perform build and cleanup artifacts and caches
 RUN \
@@ -49,21 +48,27 @@ RUN \
     git-fast-import \
     jpeg-dev \
     openssh \
+    tini \
     zlib-dev \
 && \
   apk add --no-cache --virtual .build \
     gcc \
+    g++ \
     libffi-dev \
     musl-dev \
+&& \
+  pip install --no-cache-dir --upgrade pip \
 && \
   pip install --no-cache-dir . \
 && \
   if [ "${WITH_PLUGINS}" = "true" ]; then \
     pip install --no-cache-dir \
-      "mkdocs-minify-plugin>=0.3" \
-      "mkdocs-redirects>=1.0" \
-      "pillow>=9.0" \
-      "cairosvg>=2.5"; \
+      mkdocs-material[recommended] \
+      mkdocs-material[imaging]; \
+  fi \
+&& \
+  if [ -e user-requirements.txt ]; then \
+    pip install -U -r user-requirements.txt; \
   fi \
 && \
   apk del .build \
@@ -71,7 +76,7 @@ RUN \
   for theme in mkdocs readthedocs; do \
     rm -rf ${PACKAGES}/mkdocs/themes/$theme; \
     ln -s \
-      ${PACKAGES}/material \
+      ${PACKAGES}/material/templates \
       ${PACKAGES}/mkdocs/themes/$theme; \
   done \
 && \
@@ -80,10 +85,17 @@ RUN \
   find ${PACKAGES} \
     -type f \
     -path "*/__pycache__/*" \
-    -exec rm -f {} \;
+    -exec rm -f {} \; \
+&& \
+  git config --system --add safe.directory /docs \
+&& \
+  git config --system --add safe.directory /site
 
-# Trust git directory, required for git >= 2.35.2
-RUN git config --global --add safe.directory /docs
+#  From empty image
+FROM scratch
+
+# Copy all from build
+COPY --from=build / /
 
 # Set working directory
 WORKDIR /docs
@@ -92,5 +104,5 @@ WORKDIR /docs
 EXPOSE 8000
 
 # Start development server by default
-ENTRYPOINT ["mkdocs"]
+ENTRYPOINT ["/sbin/tini", "--", "mkdocs"]
 CMD ["serve", "--dev-addr=0.0.0.0:8000"]

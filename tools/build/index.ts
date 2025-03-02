@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2022 Martin Donath <martin.donath@squidfunk.com>
+ * Copyright (c) 2016-2023 Martin Donath <martin.donath@squidfunk.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
@@ -20,12 +20,13 @@
  * IN THE SOFTWARE.
  */
 
-import { minify as minhtml } from "html-minifier"
+import { minify as minhtml } from "html-minifier-terser"
 import * as path from "path"
 import {
   EMPTY,
   concat,
   defer,
+  from,
   map,
   merge,
   mergeMap,
@@ -47,6 +48,7 @@ import {
   transformScript,
   transformStyle
 } from "./transform"
+import glob from "tiny-glob"
 
 /* ----------------------------------------------------------------------------
  * Helper types
@@ -86,14 +88,28 @@ function ext(file: string, extension: string): string {
  * @returns Minified SVG data
  */
 function minsvg(data: string): string {
+  if (!data.startsWith("<"))
+    return data
+
+  /* Optimize SVG */
   const result = optimize(data, {
     plugins: [
-      "preset-default",
-      { name: "removeDimensions", active: true },
-      { name: "removeViewBox", active: false }
+      {
+        name: "preset-default",
+        params: {
+          overrides: {
+            removeViewBox: false
+          }
+        }
+      },
+      {
+        name: "removeDimensions"
+      }
     ]
   })
-  return result.data || data
+
+  /* Return minified SVG */
+  return result.data
 }
 
 /* ----------------------------------------------------------------------------
@@ -107,7 +123,7 @@ const assets$ = concat(
   ...["*.svg", "../LICENSE"]
     .map(pattern => copyAll(pattern, {
       from: "node_modules/@mdi/svg/svg",
-      to: `${base}/.icons/material`,
+      to: `${base}/templates/.icons/material`,
       transform: async data => minsvg(data)
     })),
 
@@ -115,7 +131,7 @@ const assets$ = concat(
   ...["*.svg", "../../LICENSE"]
     .map(pattern => copyAll(pattern, {
       from: "node_modules/@primer/octicons/build/svg",
-      to: `${base}/.icons/octicons`,
+      to: `${base}/templates/.icons/octicons`,
       transform: async data => minsvg(data)
     })),
 
@@ -123,7 +139,7 @@ const assets$ = concat(
   ...["**/*.svg", "../LICENSE.txt"]
     .map(pattern => copyAll(pattern, {
       from: "node_modules/@fortawesome/fontawesome-free/svgs",
-      to: `${base}/.icons/fontawesome`,
+      to: `${base}/templates/.icons/fontawesome`,
       transform: async data => minsvg(data)
     })),
 
@@ -131,7 +147,7 @@ const assets$ = concat(
   ...["**/*.svg", "../LICENSE.md"]
     .map(pattern => copyAll(pattern, {
       from: "node_modules/simple-icons/icons",
-      to: `${base}/.icons/simple`,
+      to: `${base}/templates/.icons/simple`,
       transform: async data => minsvg(data)
     })),
 
@@ -139,11 +155,11 @@ const assets$ = concat(
   ...["min/*.js", "tinyseg.js", "wordcut.js"]
     .map(pattern => copyAll(pattern, {
       from: "node_modules/lunr-languages",
-      to: `${base}/assets/javascripts/lunr`
+      to: `${base}/templates/assets/javascripts/lunr`
     })),
 
   /* Copy images and configurations */
-  ...[".icons/*.svg", "assets/images/*", "**/*.yml"]
+  ...["**/*.{jpg,png,svg,yml}"]
     .map(pattern => copyAll(pattern, {
       from: "src",
       to: base
@@ -154,7 +170,15 @@ const assets$ = concat(
 const sources$ = copyAll("**/*.py", {
   from: "src",
   to: base,
-  watch: process.argv.includes("--watch")
+  watch: process.argv.includes("--watch"),
+  transform: async (data, name) => {
+    if (path.basename(name) === "__init__.py") {
+      const metadata = require("../../package.json")
+      return data.replace("$md-version$", metadata.version)
+    } else {
+      return data
+    }
+  }
 })
 
 /* ------------------------------------------------------------------------- */
@@ -163,7 +187,7 @@ const sources$ = copyAll("**/*.py", {
 const stylesheets$ = resolve("**/[!_]*.scss", { cwd: "src" })
   .pipe(
     mergeMap(file => zip(
-      of(ext(file, ".css")),
+      of(ext(file, ".css").replace(/(overrides|templates)\//, "")),
       transformStyle({
         from: `src/${file}`,
         to: ext(`${base}/${file}`, ".css")
@@ -172,10 +196,10 @@ const stylesheets$ = resolve("**/[!_]*.scss", { cwd: "src" })
   )
 
 /* Transform scripts */
-const javascripts$ = resolve("**/{bundle,search}.ts", { cwd: "src" })
+const javascripts$ = resolve("**/{custom,bundle,search}.ts", { cwd: "src" })
   .pipe(
     mergeMap(file => zip(
-      of(ext(file, ".js")),
+      of(ext(file, ".js").replace(/(overrides|templates)\//, "")),
       transformScript({
         from: `src/${file}`,
         to: ext(`${base}/${file}`, ".js")
@@ -191,7 +215,9 @@ const manifest$ = merge(
   })
     .map(([pattern, observable$]) => (
       defer(() => process.argv.includes("--watch")
-        ? watch(pattern, { cwd: "src" })
+        ? from(glob(pattern, { cwd: "src" })).pipe(
+          switchMap(files => watch(files, { cwd: "src" }))
+        )
         : EMPTY
       )
         .pipe(
@@ -203,7 +229,10 @@ const manifest$ = merge(
   .pipe(
     scan((prev, mapping) => (
       mapping.reduce((next, [key, value]) => (
-        next.set(key, value.replace(`${base}/`, ""))
+        next.set(key, value.replace(
+          new RegExp(`${base}\\/(overrides|templates)\\/`),
+          ""
+        ))
       ), prev)
     ), new Map<string, string>()),
   )
@@ -232,7 +261,7 @@ const templates$ = manifest$
 
         /* Normalize line feeds and minify HTML */
         const html = data.replace(/\r\n/gm, "\n")
-        return banner + minhtml(html, {
+        return banner + await minhtml(html, {
           collapseBooleanAttributes: true,
           includeAutoGeneratedTags: false,
           minifyCSS: true,
@@ -241,13 +270,15 @@ const templates$ = manifest$
           removeScriptTypeAttributes: true,
           removeStyleLinkTypeAttributes: true
         })
+          .then(html => html
 
-          /* Remove empty lines without collapsing everything */
-          .replace(/^\s*[\r\n]/gm, "")
+            /* Remove empty lines without collapsing everything */
+            .replace(/^\s*[\r\n]/gm, "")
 
-          /* Write theme version into template */
-          .replace("$md-name$", metadata.name)
-          .replace("$md-version$", metadata.version)
+            /* Write theme version into template */
+            .replace("$md-name$", metadata.name)
+            .replace("$md-version$", metadata.version)
+          )
       }
     }))
   )
@@ -255,7 +286,9 @@ const templates$ = manifest$
 /* ------------------------------------------------------------------------- */
 
 /* Compute icon mappings */
-const icons$ = defer(() => resolve("**/*.svg", { cwd: "material/.icons" }))
+const icons$ = defer(() => resolve("**/*.svg", {
+  cwd: `${base}/templates/.icons`
+}))
   .pipe(
     reduce((index, file) => index.set(
       file.replace(/\.svg$/, "").replace(/\//g, "-"),
@@ -284,7 +317,7 @@ const index$ = zip(icons$, emojis$)
       const cdn = "https://raw.githubusercontent.com"
       return {
         icons: {
-          base: `${cdn}/squidfunk/mkdocs-material/master/material/.icons/`,
+          base: `${cdn}/squidfunk/mkdocs-material/master/material/templates/.icons/`,
           data: Object.fromEntries(icons)
         },
         emojis: {
@@ -318,9 +351,7 @@ const schema$ = merge(
           "markdownDescription": `https://fonts.google.com/specimen/${
             font.replace(/\s+/g, "+")
           }`,
-          "enum": [
-            font
-          ],
+          "const": font,
         }))
       })),
       switchMap(data => write(

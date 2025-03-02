@@ -1,4 +1,4 @@
-# Copyright (c) 2016-2022 Martin Donath <martin.donath@squidfunk.com>
+# Copyright (c) 2016-2025 Martin Donath <martin.donath@squidfunk.com>
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to
@@ -18,135 +18,234 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 # IN THE SOFTWARE.
 
+from __future__ import annotations
+
 import logging
 import os
-import sys
+import re
 
-from collections import defaultdict
-from markdown.extensions.toc import slugify
-from mkdocs import utils
-from mkdocs.commands.build import DuplicateFilter
-from mkdocs.config.config_options import Type
-from mkdocs.plugins import BasePlugin
+from jinja2 import Environment
+from material.utilities.filter import FileFilter
+from mkdocs.config.defaults import MkDocsConfig
+from mkdocs.exceptions import PluginError
+from mkdocs.plugins import BasePlugin, event_priority
+from mkdocs.structure.pages import Page
+from mkdocs.utils.templates import TemplateContext
+
+from .config import TagsConfig
+from .renderer import Renderer
+from .structure.listing.manager import ListingManager
+from .structure.mapping.manager import MappingManager
 
 # -----------------------------------------------------------------------------
-# Class
+# Classes
 # -----------------------------------------------------------------------------
 
-# Tags plugin
-class TagsPlugin(BasePlugin):
+class TagsPlugin(BasePlugin[TagsConfig]):
+    """
+    A tags plugin.
+    """
 
-    # Configuration scheme
-    config_scheme = (
-        ("tags_file", Type(str, required = False)),
-    )
+    supports_multiple_instances = True
+    """
+    This plugin supports multiple instances.
+    """
 
-    # Initialize plugin
-    def on_config(self, config):
-        self.tags = defaultdict(list)
-        self.tags_file = None
+    def __init__(self, *args, **kwargs):
+        """
+        Initialize the plugin.
+        """
+        super().__init__(*args, **kwargs)
 
-        # Retrieve tags mapping from configuration
-        self.tags_map = config["extra"].get("tags")
+        # Initialize incremental builds
+        self.is_serve = False
 
-        # Use override of slugify function
-        toc = { "slugify": slugify, "separator": "-" }
-        if "toc" in config["mdx_configs"]:
-            toc = { **toc, **config["mdx_configs"]["toc"] }
-
-        # Partially apply slugify function
-        self.slugify = lambda value: (
-            toc["slugify"](str(value), toc["separator"])
-        )
-
-    # Hack: 2nd pass for tags index page(s)
-    def on_nav(self, nav, config, files):
-        file = self.config.get("tags_file")
-        if file:
-            self.tags_file = self._get_tags_file(files, file)
-
-    # Build and render tags index page
-    def on_page_markdown(self, markdown, page, config, files):
-        if page.file == self.tags_file:
-            return self._render_tag_index(markdown)
-
-        # Add page to tags index
-        for tag in page.meta.get("tags", []):
-            self.tags[tag].append(page)
-
-    # Inject tags into page (after search and before minification)
-    def on_page_context(self, context, page, config, nav):
-        if "tags" in page.meta:
-            context["tags"] = [
-                self._render_tag(tag)
-                    for tag in page.meta["tags"]
-            ]
+        # Initialize mapping and listing managers
+        self.mappings = None
+        self.listings = None
 
     # -------------------------------------------------------------------------
 
-    # Obtain tags file
-    def _get_tags_file(self, files, path):
-        file = files.get_file_from_path(path)
-        if not file:
-            log.error(f"Tags file '{path}' does not exist.")
-            sys.exit()
+    mappings: MappingManager
+    """
+    Mapping manager.
+    """
 
-        # Add tags file to files
-        files.append(file)
-        return file
+    listings: ListingManager
+    """
+    Listing manager.
+    """
 
-    # Render tags index
-    def _render_tag_index(self, markdown):
-        if not "[TAGS]" in markdown:
-            markdown += "\n[TAGS]"
+    filter: FileFilter
+    """
+    File filter.
+    """
 
-        # Replace placeholder in Markdown with rendered tags index
-        return markdown.replace("[TAGS]", "\n".join([
-            self._render_tag_links(*args)
-                for args in sorted(self.tags.items())
-        ]))
+    # -------------------------------------------------------------------------
 
-    # Render the given tag and links to all pages with occurrences
-    def _render_tag_links(self, tag, pages):
-        classes = ["md-tag"]
-        if isinstance(self.tags_map, dict):
-            classes.append("md-tag-icon")
-            type = self.tags_map.get(tag)
-            if type:
-                classes.append(f"md-tag-icon--{type}")
+    def on_startup(self, *, command, **kwargs) -> None:
+        """
+        Determine whether we're serving the site.
 
-        # Render section for tag and a link to each page
-        classes = " ".join(classes)
-        content = [f"## <span class=\"{classes}\">{tag}</span>", ""]
-        for page in pages:
+        Arguments:
+            command: The command that is being executed.
+            dirty: Whether dirty builds are enabled.
+        """
+        self.is_serve = command == "serve"
 
-            # Ensure forward slashes, as we have to use the path of the source
-            # file which contains the operating system's path separator.
-            url = utils.get_relative_url(
-                page.file.src_path.replace(os.path.sep, "/"),
-                self.tags_file.src_path.replace(os.path.sep, "/")
+    def on_config(self, config: MkDocsConfig) -> None:
+        """
+        Create mapping and listing managers.
+        """
+
+        # Retrieve toc depth, so we know the maximum level at which we can add
+        # items to the table of contents - Python Markdown allows to set the
+        # toc depth as a range, e.g. `2-6`, so we need to account for that as
+        # well. We need this information for generating listings.
+        depth = config.mdx_configs.get("toc", {}).get("toc_depth", 6)
+        if not isinstance(depth, int) and "-" in depth:
+            _, depth = depth.split("-")
+
+        # Initialize mapping and listing managers
+        self.mappings = MappingManager(self.config)
+        self.listings = ListingManager(self.config, int(depth))
+
+        # Initialize file filter - the file filter is used to include or exclude
+        # entire subsections of the documentation, allowing for using multiple
+        # instances of the plugin alongside each other. This can be necessary
+        # when creating multiple, potentially conflicting listings.
+        self.filter = FileFilter(self.config.filters)
+
+        # Ensure presence of attribute lists extension
+        for extension in config.markdown_extensions:
+            if isinstance(extension, str) and extension.endswith("attr_list"):
+                break
+        else:
+            config.markdown_extensions.append("attr_list")
+
+    @event_priority(-50)
+    def on_page_markdown(
+        self, markdown: str, *, page: Page, config: MkDocsConfig, **kwargs
+    ) -> str:
+        """
+        Collect tags and listings from page.
+
+        Priority: -50 (run later)
+
+        Arguments:
+            markdown: The page's Markdown.
+            page: The page.
+            config: The MkDocs configuration.
+
+        Returns:
+            The page's Markdown with injection points.
+        """
+        if not self.config.enabled:
+            return
+
+        # Skip if page should not be considered
+        if not self.filter(page.file):
+            return
+
+        # Handle deprecation of `tags_file` setting
+        if self.config.tags_file:
+            markdown = self._handle_deprecated_tags_file(page, markdown)
+
+        # Collect tags from page
+        try:
+            self.mappings.add(page, markdown)
+
+        # Raise exception if tags could not be read
+        except Exception as e:
+            docs = os.path.relpath(config.docs_dir)
+            path = os.path.relpath(page.file.abs_src_path, docs)
+            raise PluginError(
+                    f"Error reading tags of page '{path}' in '{docs}':\n"
+                    f"{e}"
+                )
+
+        # Collect listings from page
+        return self.listings.add(page, markdown)
+
+    @event_priority(100)
+    def on_env(
+        self, env: Environment, *, config: MkDocsConfig, **kwargs
+    ) -> None:
+        """
+        Populate listings.
+
+        Priority: 100 (run earliest)
+
+        Arguments:
+            env: The Jinja environment.
+            config: The MkDocs configuration.
+        """
+        if not self.config.enabled:
+            return
+
+        # Populate and render all listings
+        self.listings.populate_all(self.mappings, Renderer(env, config))
+
+    def on_page_context(
+        self, context: TemplateContext, *, page: Page, **kwargs
+    ) -> None:
+        """
+        Add tag references to page context.
+
+        Arguments:
+            context: The template context.
+            page: The page.
+        """
+        if not self.config.enabled:
+            return
+
+        # Skip if page should not be considered
+        if not self.filter(page.file):
+            return
+
+        # Skip if tags should not be built
+        if not self.config.tags:
+            return
+
+        # Retrieve tags references for page
+        mapping = self.mappings.get(page)
+        if mapping:
+            tags = self.config.tags_name_variable
+            if tags not in context:
+                context[tags] = list(self.listings & mapping)
+
+    # -------------------------------------------------------------------------
+
+    def _handle_deprecated_tags_file(
+        self, page: Page, markdown: str
+    ) -> str:
+        """
+        Handle deprecation of `tags_file` setting.
+
+        Arguments:
+            page: The page.
+        """
+        directive = self.config.listings_directive
+        if page.file.src_uri != self.config.tags_file:
+            return markdown
+
+        # Try to find the legacy tags marker and replace with directive
+        if "[TAGS]" in markdown:
+            markdown = markdown.replace(
+                "[TAGS]", f"<!-- {directive} -->"
             )
 
-            # Render link to page
-            title = page.meta.get("title", page.title)
-            content.append(f"- [{title}]({url})")
+        # Try to find the directive and add it if not present
+        pattern = r"<!--\s+{directive}".format(directive = directive)
+        if not re.search(pattern, markdown):
+            markdown += f"\n<!-- {directive} -->"
 
-        # Return rendered tag links
-        return "\n".join(content)
-
-    # Render the given tag, linking to the tags index (if enabled)
-    def _render_tag(self, tag):
-        type = self.tags_map.get(tag) if self.tags_map else None
-        if not self.tags_file or not self.slugify:
-            return dict(name = tag, type = type)
-        else:
-            url = f"{self.tags_file.url}#{self.slugify(tag)}"
-            return dict(name = tag, type = type, url = url)
+        # Return markdown
+        return markdown
 
 # -----------------------------------------------------------------------------
 # Data
 # -----------------------------------------------------------------------------
 
 # Set up logging
-log = logging.getLogger("mkdocs")
-log.addFilter(DuplicateFilter())
+log = logging.getLogger("mkdocs.material.plugins.tags")
